@@ -37,6 +37,19 @@ def filename_for(entry: Entry, link: Link) -> str:
     return base + ext
 
 
+def _unique_path(dest_dir: Path, filename: str) -> Path:
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 1
+    while True:
+        candidate = dest_dir / f"{stem} ({counter}){suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def download(
     url: str,
     dest_dir: Path,
@@ -46,23 +59,29 @@ def download(
 ) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     fallback = _sanitize(unquote(Path(urlparse(url).path).name)) or "download"
-    target = dest_dir / (filename or fallback)
-    with httpx.stream(
-        "GET",
-        url,
-        follow_redirects=True,
-        timeout=TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
-    ) as response:
-        response.raise_for_status()
-        total = int(response.headers.get("content-length", 0))
-        received = 0
-        with target.open("wb") as fh:
-            for chunk in response.iter_bytes(chunk_size=65536):
-                fh.write(chunk)
-                received += len(chunk)
-                if progress:
-                    progress(received, total)
+    target = _unique_path(dest_dir, filename or fallback)
+    part = target.with_name(target.name + ".part")
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            follow_redirects=True,
+            timeout=TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        ) as response:
+            response.raise_for_status()
+            total = int(response.headers.get("content-length", 0))
+            received = 0
+            with part.open("wb") as fh:
+                for chunk in response.iter_bytes(chunk_size=65536):
+                    fh.write(chunk)
+                    received += len(chunk)
+                    if progress:
+                        progress(received, total)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    part.replace(target)
     return target
 
 

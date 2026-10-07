@@ -61,6 +61,8 @@ class OPDSApp(App):
         Binding("o", "open_reader", "Open+Read"),
         Binding("d", "download", "Download"),
         Binding("slash", "search", "Search"),
+        Binding("S", "search_all", "Search all"),
+        Binding("n", "load_more", "Load more"),
         Binding("a", "add_catalog", "Add catalog"),
         Binding("x", "remove_catalog", "Remove catalog", show=False),
         Binding("r", "reload", "Reload"),
@@ -76,6 +78,8 @@ class OPDSApp(App):
         self.history: list[Feed] = []
         self.current_feed: Feed | None = None
         self.entries: list[Entry] = []
+        self.catalog_label = ""
+        self.entry_catalogs: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -91,7 +95,7 @@ class OPDSApp(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#entries", DataTable)
-        table.add_columns("Title", "Author", "Type")
+        table.add_columns("Catalog", "Title", "Author", "Type")
         self._populate_catalogs()
         self.query_one("#catalogs", ListView).focus()
 
@@ -114,16 +118,21 @@ class OPDSApp(App):
         else:
             self.sub_title = f"{len(self.config.catalogs)} catalogs"
 
-    def _display_feed(self, feed: Feed) -> None:
+    def _display_feed(self, feed: Feed, *, catalogs: list[str] | None = None) -> None:
         self.current_feed = feed
         self.entries = list(feed.entries)
+        if catalogs is not None:
+            self.entry_catalogs = list(catalogs)
+        else:
+            self.entry_catalogs = [self.catalog_label] * len(self.entries)
         title = feed.title or feed.url or "Feed"
         hint = " (navigation)" if feed.is_navigation else ""
         self.query_one("#feed-title", Static).update(f"[bold]{escape(title)}[/bold]{hint}")
         table = self.query_one("#entries", DataTable)
         table.clear()
-        for entry in self.entries:
+        for index, entry in enumerate(self.entries):
             table.add_row(
+                escape(self.entry_catalogs[index] if index < len(self.entry_catalogs) else ""),
                 escape(entry.title or "(untitled)"),
                 escape(entry.author_str),
                 self._type_label(entry),
@@ -201,6 +210,26 @@ class OPDSApp(App):
         self._display_feed(results)
         self.notify(f"{len(results.entries)} result(s) for '{query}'")
 
+    @work(exclusive=True, group="search")
+    async def _run_search_all(self, query: str) -> None:
+        self.sub_title = f"Searching all catalogs for '{query}'..."
+        try:
+            results, errors = await asyncio.to_thread(
+                self.client.search_all, self.config.catalogs, query
+            )
+        except OPDSException as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            self._set_subtitle()
+            return
+        entries = [entry for _, entry in results]
+        catalogs = [name for name, _ in results]
+        feed = Feed(title=f"Search all: {query}", entries=entries)
+        self._display_feed(feed, catalogs=catalogs)
+        message = f"{len(results)} result(s) for '{query}'"
+        if errors:
+            message += f" ({len(errors)} catalog(s) failed)"
+        self.notify(message)
+
     @work(exclusive=True, group="download")
     async def _download_entry(self, entry: Entry, *, open_after: bool) -> None:
         link = entry.best_acquisition
@@ -209,9 +238,17 @@ class OPDSApp(App):
             return
         filename = filename_for(entry, link)
         dest = self.config.download_dir
-        self.sub_title = f"Downloading {entry.title}..."
+        label = entry.title or filename
+        self.sub_title = f"Downloading {label}..."
+
+        def progress(received: int, total: int) -> None:
+            pct = (received * 100 // total) if total else 0
+            self.call_from_thread(self._set_progress, label, pct)
+
         try:
-            path = await asyncio.to_thread(download_file, link.href, dest, filename)
+            path = await asyncio.to_thread(
+                download_file, link.href, dest, filename, progress=progress
+            )
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Download failed: {exc}", severity="error", timeout=8)
             self._set_subtitle()
@@ -225,10 +262,10 @@ class OPDSApp(App):
             except Exception as exc:  # noqa: BLE001
                 self.notify(f"Could not open reader: {exc}", severity="error")
 
-    # --------------------------------------------------------------- actions
-    def _focused_pane(self):
-        return self.focused
+    def _set_progress(self, label: str, pct: int) -> None:
+        self.sub_title = f"Downloading {label}... {pct}%"
 
+    # --------------------------------------------------------------- actions
     def action_move_down(self) -> None:
         focused = self.focused
         if isinstance(focused, (DataTable, ListView)):
@@ -282,6 +319,7 @@ class OPDSApp(App):
         if index is None or index < 0 or index >= len(self.config.catalogs):
             return
         catalog = self.config.catalogs[index]
+        self.catalog_label = catalog.name
         self._fetch_feed(catalog.url, reset=True, label=catalog.name)
 
     def action_download(self) -> None:
@@ -298,6 +336,13 @@ class OPDSApp(App):
         def done(query: str | None) -> None:
             if query:
                 self._run_search(query)
+
+        self.push_screen(SearchScreen(), done)
+
+    def action_search_all(self) -> None:
+        def done(query: str | None) -> None:
+            if query:
+                self._run_search_all(query)
 
         self.push_screen(SearchScreen(), done)
 
@@ -330,6 +375,36 @@ class OPDSApp(App):
     def action_reload(self) -> None:
         if self.current_feed and self.current_feed.url:
             self._fetch_feed(self.current_feed.url, reset=True, label=self.current_feed.title)
+
+    def action_load_more(self) -> None:
+        if not self.current_feed or not self.current_feed.next_url:
+            self.notify("No more entries.", severity="warning")
+            return
+        self._fetch_more(self.current_feed.next_url)
+
+    @work(exclusive=True, group="fetch")
+    async def _fetch_more(self, url: str) -> None:
+        self.sub_title = "Loading more..."
+        try:
+            feed = await asyncio.to_thread(self.client.fetch, url)
+        except OPDSException as exc:
+            self.notify(str(exc), severity="error", timeout=8)
+            self._set_subtitle()
+            return
+        self.current_feed.entries.extend(feed.entries)
+        self.current_feed.links = feed.links
+        table = self.query_one("#entries", DataTable)
+        for entry in feed.entries:
+            self.entries.append(entry)
+            self.entry_catalogs.append(self.catalog_label)
+            table.add_row(
+                escape(self.catalog_label),
+                escape(entry.title or "(untitled)"),
+                escape(entry.author_str),
+                self._type_label(entry),
+            )
+        self._set_subtitle()
+        self.notify(f"Loaded {len(feed.entries)} more.")
 
     def action_focus_next_pane(self) -> None:
         focused = self.focused

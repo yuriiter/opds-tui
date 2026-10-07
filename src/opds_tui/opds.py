@@ -24,6 +24,43 @@ def _absolute(base: str, href: str) -> str:
     return urljoin(base, href)
 
 
+def _expand_search_template(template: str, query: str) -> str | None:
+    """Expand a search URL template for an OpenSearch or RFC 6570 placeholder."""
+    q = quote(query)
+    if "{searchTerms}" in template:
+        return template.replace("{searchTerms}", q)
+    if "{?query}" in template:
+        prefix = template.split("{?query}", 1)[0]
+        sep = "&" if "?" in prefix else "?"
+        return template.replace("{?query}", f"{sep}query={q}")
+    if "{query}" in template:
+        return template.replace("{query}", q)
+    return None
+
+
+LANG_ALIASES: dict[str, set[str]] = {
+    "de": {"de", "deu", "ger", "german", "deutsch"},
+    "es": {"es", "spa", "spanish", "espanol", "español"},
+    "fr": {"fr", "fra", "fre", "french", "francais", "français"},
+    "it": {"it", "ita", "italian", "italiano"},
+    "en": {"en", "eng", "english"},
+    "ru": {"ru", "rus", "russian", "русский"},
+}
+
+
+def entry_matches_language(entry: Entry, language: str) -> bool:
+    target = language.strip().lower()
+    aliases = LANG_ALIASES.get(target, {target})
+    value = entry.language
+    if isinstance(value, (list, tuple)):
+        values = [str(v).strip().lower() for v in value]
+    elif isinstance(value, str):
+        values = [value.strip().lower()]
+    else:
+        return False
+    return any(v and (v in aliases or any(v.startswith(a) for a in aliases)) for v in values)
+
+
 def _parse_atom(data: bytes, url: str) -> Feed:
     parsed = feedparser.parse(data)
     feed = Feed(
@@ -67,6 +104,72 @@ def _parse_atom(data: bytes, url: str) -> Feed:
     return feed
 
 
+def _link_from(link: dict, url: str) -> Link:
+    return Link(
+        href=_absolute(url, link.get("href", "")),
+        rel=link.get("rel", ""),
+        type=link.get("type", ""),
+        title=link.get("title", ""),
+    )
+
+
+def _coerce_language(value: object) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return value if isinstance(value, str) else ""
+
+
+def _entry_from_publication(item: dict, url: str) -> Entry:
+    metadata = item.get("metadata", {})
+    entry = Entry(
+        title=metadata.get("title", ""),
+        id=metadata.get("identifier", ""),
+        summary=metadata.get("description", ""),
+        updated=metadata.get("modified", ""),
+        language=_coerce_language(metadata.get("language", "")),
+    )
+    author = metadata.get("author")
+    if isinstance(author, str):
+        entry.authors.append(author)
+    elif isinstance(author, dict):
+        name = author.get("name")
+        if name:
+            entry.authors.append(name)
+    elif isinstance(author, list):
+        for a in author:
+            name = a.get("name") if isinstance(a, dict) else a
+            if name:
+                entry.authors.append(name)
+    for link in item.get("links", []):
+        entry.links.append(_link_from(link, url))
+    return entry
+
+
+def _entry_from_navigation(item: dict, url: str) -> Entry:
+    metadata = item.get("metadata", {})
+    href = item.get("href", "")
+    title = item.get("title") or metadata.get("title", "")
+    entry = Entry(
+        title=title,
+        id=item.get("identifier") or href,
+        summary=metadata.get("description", ""),
+        updated=metadata.get("modified", ""),
+        language=_coerce_language(metadata.get("language", "")),
+    )
+    if href:
+        entry.links.append(
+            Link(
+                href=_absolute(url, href),
+                rel=item.get("rel", "subsection"),
+                type=item.get("type", ""),
+                title=title,
+            )
+        )
+    for link in item.get("links", []):
+        entry.links.append(_link_from(link, url))
+    return entry
+
+
 def _parse_opds2(data: dict, url: str) -> Feed:
     feed = Feed(
         title=data.get("metadata", {}).get("title", ""),
@@ -75,47 +178,36 @@ def _parse_opds2(data: dict, url: str) -> Feed:
         url=url,
     )
     for link in data.get("links", []):
-        feed.links.append(
-            Link(
-                href=_absolute(url, link.get("href", "")),
-                rel=link.get("rel", ""),
-                type=link.get("type", ""),
-                title=link.get("title", ""),
-            )
-        )
-    raw_entries = data.get("navigation", []) + data.get("publications", [])
-    for item in raw_entries:
-        metadata = item.get("metadata", {})
-        entry = Entry(
-            title=metadata.get("title", ""),
-            id=metadata.get("identifier", ""),
-            summary=metadata.get("description", ""),
-            updated=metadata.get("modified", ""),
-            language=metadata.get("language", ""),
-        )
-        author = metadata.get("author")
-        if isinstance(author, str):
-            entry.authors.append(author)
-        elif isinstance(author, dict):
-            name = author.get("name")
-            if name:
-                entry.authors.append(name)
-        elif isinstance(author, list):
-            for a in author:
-                name = a.get("name") if isinstance(a, dict) else a
-                if name:
-                    entry.authors.append(name)
-        for link in item.get("links", []):
-            entry.links.append(
-                Link(
-                    href=_absolute(url, link.get("href", "")),
-                    rel=link.get("rel", ""),
-                    type=link.get("type", ""),
-                    title=link.get("title", ""),
+        feed.links.append(_link_from(link, url))
+
+    for item in data.get("navigation", []):
+        feed.entries.append(_entry_from_navigation(item, url))
+
+    for item in data.get("publications", []):
+        feed.entries.append(_entry_from_publication(item, url))
+
+    # OPDS 2 groups (e.g. Internet Archive) hold publications plus a nav link
+    for group in data.get("groups", []):
+        metadata = group.get("metadata", {})
+        group_links = group.get("links", [])
+        if group_links and group_links[0].get("href"):
+            feed.entries.append(
+                _entry_from_navigation(
+                    {
+                        "title": metadata.get("title", ""),
+                        "href": group_links[0]["href"],
+                        "rel": group_links[0].get("rel", "subsection"),
+                        "type": group_links[0].get("type", ""),
+                    },
+                    url,
                 )
             )
-        feed.entries.append(entry)
-    feed.is_navigation = bool(data.get("navigation")) and not data.get("publications")
+        for item in group.get("publications", []):
+            feed.entries.append(_entry_from_publication(item, url))
+
+    feed.is_navigation = bool(data.get("navigation")) and not (
+        data.get("publications") or data.get("groups")
+    )
     return feed
 
 
@@ -188,15 +280,52 @@ class OPDSClient:
             fallback = fallback or template
         return fallback
 
-    def search(self, feed: Feed, query: str) -> Feed:
+    def _fetch_pages(self, feed: Feed, max_pages: int) -> Feed:
+        pages = 1
+        while pages < max_pages and feed.next_url:
+            try:
+                nxt = self.fetch(feed.next_url)
+            except OPDSException:
+                break
+            feed.entries.extend(nxt.entries)
+            feed.links = nxt.links
+            pages += 1
+        return feed
+
+    def search(self, feed: Feed, query: str, max_pages: int = 1) -> Feed:
         template = feed.search_template or self._fetch_search_template(feed)
         if template:
-            url = template.replace("{searchTerms}", quote(query))
-            try:
-                return self.fetch(url)
-            except OPDSException:
-                pass
+            url = _expand_search_template(template, query)
+            if url:
+                try:
+                    return self._fetch_pages(self.fetch(url), max_pages)
+                except OPDSException:
+                    pass
         return filter_feed(feed, query)
+
+    def search_all(
+        self,
+        catalogs: list,
+        query: str,
+        language: str | None = None,
+        max_pages: int = 1,
+    ) -> tuple[list[tuple[str, Entry]], dict[str, str]]:
+        results: list[tuple[str, Entry]] = []
+        errors: dict[str, str] = {}
+        for catalog in catalogs:
+            try:
+                feed = self.fetch(catalog.url)
+                found = self.search(feed, query, max_pages=max_pages)
+            except OPDSException as exc:
+                errors[catalog.name] = str(exc)
+                continue
+            for entry in found.entries:
+                if not entry.best_acquisition:
+                    continue
+                if language and not entry_matches_language(entry, language):
+                    continue
+                results.append((catalog.name, entry))
+        return results, errors
 
 
 def filter_feed(feed: Feed, query: str) -> Feed:

@@ -10,7 +10,7 @@ from .config import Config
 from .download import download as download_file
 from .download import filename_for, open_with_reader
 from .models import Catalog, Entry, Feed
-from .opds import OPDSClient, OPDSException
+from .opds import OPDSClient, OPDSException, entry_matches_language
 
 console = Console()
 err_console = Console(stderr=True)
@@ -70,6 +70,39 @@ def _render_entries(feed: Feed, show_links: bool = False) -> None:
             row.append(extra)
         table.add_row(*row)
     console.print(table)
+
+
+def _render_search_results(
+    results: list[tuple[str, Entry]], errors: dict[str, str], show_links: bool = False
+) -> None:
+    if results:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Catalog")
+        table.add_column("Title", overflow="fold")
+        table.add_column("Author", overflow="fold")
+        table.add_column("Type")
+        if show_links:
+            table.add_column("Link", overflow="fold")
+        for index, (name, entry) in enumerate(results, 1):
+            if entry.best_acquisition:
+                kind = entry.best_acquisition.type or "file"
+                extra = entry.best_acquisition.href
+            elif entry.is_navigation:
+                kind = "nav"
+                extra = entry.navigation_url or ""
+            else:
+                kind = "-"
+                extra = ""
+            row = [str(index), name, entry.title or "(untitled)", entry.author_str, kind]
+            if show_links:
+                row.append(extra)
+            table.add_row(*row)
+        console.print(table)
+    else:
+        console.print("[yellow]No results.[/yellow]")
+    for name, err in errors.items():
+        err_console.print(f"[yellow]{name}:[/yellow] {err}")
 
 
 @catalog_app.command("add")
@@ -141,20 +174,46 @@ def browse(
 
 @app.command("search")
 def search(
-    catalog: str = typer.Argument(..., help="Catalog name"),
-    query: str = typer.Argument(..., help="Search terms (title, author, text)"),
+    catalog: str | None = typer.Argument(None, help="Catalog name (omit with --all)"),
+    query: str | None = typer.Argument(None, help="Search terms (title, author, text)"),
+    all_catalogs: bool = typer.Option(False, "--all", help="Search every configured catalog"),
+    language: str | None = typer.Option(
+        None, "--language", "--lang", help="Filter by language (de/es/fr/it/...)"
+    ),
+    pages: int = typer.Option(1, "--pages", "-p", help="Max pages of results per catalog"),
     links: bool = typer.Option(False, "--links", "-l", help="Show entry links"),
 ) -> None:
-    """Search within a catalog by text, title or author."""
+    """Search a catalog (or all catalogs with --all) by text, title or author."""
+    if all_catalogs and query is None:
+        query, catalog = catalog, None
+    if not query:
+        raise typer.BadParameter("QUERY is required")
     config = Config()
-    entry = config.get_catalog(catalog)
-    if not entry:
-        err_console.print(f"[red]Unknown catalog:[/red] {catalog}")
-        raise typer.Exit(1)
     with _client() as client:
+        if all_catalogs:
+            try:
+                results, errors = client.search_all(
+                    config.catalogs, query, language=language, max_pages=pages
+                )
+            except OPDSException as exc:
+                err_console.print(f"[red]{exc}[/red]")
+                raise typer.Exit(1)
+            _render_search_results(results, errors, show_links=links)
+            return
+        if not catalog:
+            raise typer.BadParameter("Provide a CATALOG name or --all")
+        entry = config.get_catalog(catalog)
+        if not entry:
+            err_console.print(f"[red]Unknown catalog:[/red] {catalog}")
+            raise typer.Exit(1)
         try:
             feed = client.fetch(entry.url)
-            results = client.search(feed, query)
+            results = client.search(feed, query, max_pages=pages)
+            results.entries = [
+                e
+                for e in results.entries
+                if language is None or entry_matches_language(e, language)
+            ]
         except OPDSException as exc:
             err_console.print(f"[red]{exc}[/red]")
             raise typer.Exit(1)
@@ -163,42 +222,66 @@ def search(
 
 @app.command("get")
 def get(
-    catalog: str = typer.Argument(..., help="Catalog name"),
-    query: str = typer.Argument(..., help="Search terms"),
+    catalog: str | None = typer.Argument(None, help="Catalog name (omit with --all)"),
+    query: str | None = typer.Argument(None, help="Search terms"),
     index: int = typer.Option(1, "--index", "-i", help="Which result to download (1-based)"),
+    all_catalogs: bool = typer.Option(False, "--all", help="Search every configured catalog"),
+    language: str | None = typer.Option(
+        None, "--language", "--lang", help="Filter by language (de/es/fr/it/...)"
+    ),
+    pages: int = typer.Option(1, "--pages", "-p", help="Max pages of results per catalog"),
     output: Path | None = typer.Option(None, "--output", "-o", help="Destination directory"),
 ) -> None:
-    """Search a catalog and download a matching ebook."""
+    """Search a catalog (or all with --all) and download a matching ebook."""
+    if all_catalogs and query is None:
+        query, catalog = catalog, None
+    if not query:
+        raise typer.BadParameter("QUERY is required")
     config = Config()
-    entry = config.get_catalog(catalog)
-    if not entry:
-        err_console.print(f"[red]Unknown catalog:[/red] {catalog}")
-        raise typer.Exit(1)
+    dest = output or config.download_dir
     with _client() as client:
-        try:
-            feed = client.fetch(entry.url)
-            results = client.search(feed, query)
-        except OPDSException as exc:
-            err_console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(1)
-        matches = [e for e in results.entries if e.best_acquisition or e.is_navigation]
-        if not matches:
-            err_console.print("[yellow]No results.[/yellow]")
-            raise typer.Exit(1)
-        if index < 1 or index > len(matches):
-            err_console.print(f"[red]Index out of range (1-{len(matches)}).[/red]")
-            raise typer.Exit(1)
-        match = matches[index - 1]
-        if not match.best_acquisition and match.navigation_url:
+        if all_catalogs:
             try:
-                detail = client.fetch(match.navigation_url)
+                results, errors = client.search_all(
+                    config.catalogs, query, language=language, max_pages=pages
+                )
             except OPDSException as exc:
                 err_console.print(f"[red]{exc}[/red]")
                 raise typer.Exit(1)
-            resolved = next((e for e in detail.entries if e.best_acquisition), None)
-            if resolved:
-                match = resolved
-    _download_entry(match, output or config.download_dir)
+            for name, err in errors.items():
+                err_console.print(f"[yellow]{name}:[/yellow] {err}")
+            if not results:
+                err_console.print("[yellow]No results.[/yellow]")
+                raise typer.Exit(1)
+            if index < 1 or index > len(results):
+                err_console.print(f"[red]Index out of range (1-{len(results)}).[/red]")
+                raise typer.Exit(1)
+            _resolve_and_download(client, results[index - 1][1], dest)
+            return
+        if not catalog:
+            raise typer.BadParameter("Provide a CATALOG name or --all")
+        entry = config.get_catalog(catalog)
+        if not entry:
+            err_console.print(f"[red]Unknown catalog:[/red] {catalog}")
+            raise typer.Exit(1)
+        try:
+            feed = client.fetch(entry.url)
+            results = client.search(feed, query, max_pages=pages)
+            entries = [
+                e
+                for e in results.entries
+                if language is None or entry_matches_language(e, language)
+            ]
+        except OPDSException as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        if not entries:
+            err_console.print("[yellow]No results.[/yellow]")
+            raise typer.Exit(1)
+        if index < 1 or index > len(entries):
+            err_console.print(f"[red]Index out of range (1-{len(entries)}).[/red]")
+            raise typer.Exit(1)
+        _resolve_and_download(client, entries[index - 1], dest)
 
 
 @app.command("download")
@@ -234,6 +317,20 @@ def _download_entry(entry: Entry, dest: Path, reader: str | None = None) -> None
     console.print(f"Saved [bold]{entry.title}[/bold] to [bold]{path}[/bold]")
     if reader:
         open_with_reader(path, reader)
+
+
+def _resolve_and_download(client: OPDSClient, entry: Entry, dest: Path) -> None:
+    match = entry
+    if not match.best_acquisition and match.navigation_url:
+        try:
+            detail = client.fetch(match.navigation_url)
+        except OPDSException as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        resolved = next((e for e in detail.entries if e.best_acquisition), None)
+        if resolved:
+            match = resolved
+    _download_entry(match, dest)
 
 
 @app.command("open")

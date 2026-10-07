@@ -54,7 +54,7 @@ class Link:
     def is_navigation(self) -> bool:
         if self.rel in (SUBSECTION_REL, NAVIGATION_REL):
             return True
-        return "opds-catalog" in self.type or "atom+xml" in self.type
+        return "opds-catalog" in self.type or "atom+xml" in self.type or "opds+json" in self.type
 
 
 @dataclass

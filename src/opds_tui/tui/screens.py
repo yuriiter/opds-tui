@@ -107,6 +107,7 @@ class HelpScreen(ModalScreen[None]):
   g / G        go to first / last item
   h            go back in history
   l / enter    open selected item
+  n            load next page of results
   tab          switch between catalogs and entries
   r            reload current feed
 
@@ -117,6 +118,7 @@ class HelpScreen(ModalScreen[None]):
 
 [bold]Books[/bold]
   /            search current catalog
+  S            search every configured catalog
   d            download selected ebook
   o            download and open in reader
   esc          close this help / go back
